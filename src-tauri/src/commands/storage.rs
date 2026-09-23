@@ -432,6 +432,23 @@ fn looks_like_packaged_runtime_dir(exe_dir: &Path) -> bool {
         .any(|name| exe_dir.join(name).is_dir())
 }
 
+fn current_exe_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    Some(dunce::canonicalize(&dir).unwrap_or(dir))
+}
+
+/// 另一份安装的打包数据目录，不能接管
+fn is_foreign_packaged_data_dir(candidate: &Path, current_exe_dir: &Path) -> bool {
+    let Some(owner) = candidate.parent() else {
+        return false;
+    };
+    let owner = dunce::canonicalize(owner).unwrap_or_else(|_| owner.to_path_buf());
+    if owner == current_exe_dir {
+        return false;
+    }
+    looks_like_packaged_runtime_dir(&owner)
+}
+
 fn push_unique_storage_candidate(
     candidates: &mut Vec<PathBuf>,
     path: PathBuf,
@@ -449,7 +466,12 @@ fn default_storage_candidates(
 ) -> Result<Vec<PathBuf>, String> {
     let mut candidates = Vec::new();
     if let Some(previous_default) = read_last_default_storage_dir()? {
-        push_unique_storage_candidate(&mut candidates, previous_default, current_default);
+        let foreign = current_exe_dir()
+            .map(|dir| is_foreign_packaged_data_dir(&previous_default, &dir))
+            .unwrap_or(false);
+        if !foreign {
+            push_unique_storage_candidate(&mut candidates, previous_default, current_default);
+        }
     }
     let legacy = legacy_app_storage_dir(app_handle)?;
     push_unique_storage_candidate(&mut candidates, legacy, current_default);
@@ -702,8 +724,8 @@ pub async fn clear_app_storage_migration(
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_existing_storage_into_default, looks_like_packaged_runtime_dir,
-        DefaultStorageSelection,
+        adopt_existing_storage_into_default, is_foreign_packaged_data_dir,
+        looks_like_packaged_runtime_dir, DefaultStorageSelection,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -715,6 +737,25 @@ mod tests {
 
         fs::create_dir_all(dir.path().join("agent")).expect("create agent");
         assert!(looks_like_packaged_runtime_dir(dir.path()));
+    }
+
+    #[test]
+    fn foreign_install_data_dir_is_never_adopted() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let other_install = root.path().join("other-install");
+        let our_install = root.path().join("our-install");
+        fs::create_dir_all(other_install.join("agent")).expect("create agent");
+        fs::create_dir_all(&our_install).expect("create our install");
+        let other_install = dunce::canonicalize(&other_install).expect("canonical other");
+        let our_install = dunce::canonicalize(&our_install).expect("canonical ours");
+        let foreign = other_install.join("data");
+
+        assert!(is_foreign_packaged_data_dir(&foreign, &our_install));
+        assert!(!is_foreign_packaged_data_dir(&foreign, &other_install));
+        assert!(!is_foreign_packaged_data_dir(
+            &root.path().join("legacy"),
+            &our_install
+        ));
     }
 
     #[test]

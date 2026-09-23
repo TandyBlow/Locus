@@ -29,6 +29,9 @@ const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const DEV_ISOLATED_COMMAND = "dev-isolated";
 const DEV_WITH_MCP_ISOLATED_COMMAND = "dev-mcp-isolated";
 const DEV_SERVER_PORT = 14901;
+const DEV_RUNTIME_DIRNAME = ".locus-dev-runtime";
+const RUNTIME_DATA_DIR_ENV_KEY = "LOCUS_RUNTIME_DATA_DIR";
+const RUNTIME_ROOT_ENV_KEY = "LOCUS_RUNTIME_ROOT";
 const DEV_SERVER_START_TIMEOUT_MS = 30_000;
 const DEV_PREREQUISITE_SCRIPTS = [
   "compile-server:ensure",
@@ -101,6 +104,34 @@ const shouldExposeWebView2DebugPort =
 if (isolatedRuntime.enabled && isHelpOrVersionCommand) {
   printIsolatedDevHelp();
   process.exit(0);
+}
+
+const hasRuntimeEnvOverride = Boolean(
+  process.env[RUNTIME_DATA_DIR_ENV_KEY]?.trim() ||
+    process.env[RUNTIME_ROOT_ENV_KEY]?.trim(),
+);
+
+if (
+  isCustomDevCommand &&
+  !isolatedRuntime.enabled &&
+  !isHelpOrVersionCommand &&
+  !hasRuntimeEnvOverride
+) {
+  console.error(
+    [
+      "[locus] Refusing to start a dev instance without an isolated runtime.",
+      "  A dev build shares its persistent config directory with an installed",
+      "  Locus, and startup can relocate the other install's data directory.",
+      "  Pass --isolated:",
+      "",
+      "    bun tauri dev --isolated",
+      "",
+      `  Runtime data lands in ${path.join(repoRoot, DEV_RUNTIME_DIRNAME)}.`,
+      "  Point it elsewhere with --runtime-root <dir>, or set",
+      `  ${RUNTIME_DATA_DIR_ENV_KEY} to supply your own isolated runtime.`,
+    ].join("\n"),
+  );
+  process.exit(2);
 }
 
 if (isolatedRuntime.enabled) {
@@ -212,9 +243,24 @@ function prepareIsolatedRuntime(requestedPaths, skipOnboarding) {
 }
 
 function createGeneratedRuntimeRoot(requestedBase) {
-  const base = resolveIsolatedRuntimeBase(requestedBase);
+  const resolvedBase = resolveIsolatedRuntimeBase(requestedBase);
+  if (!resolvedBase && usesRepoLocalDevRuntime()) {
+    return ensureRepoLocalDevRuntimeRoot();
+  }
+  const base = resolvedBase ?? tmpdir();
   mkdirSync(base, { recursive: true });
   return mkdtempSync(path.join(base, "locus-app-test-"));
+}
+
+// dev 命令复用固定目录，重启不丢数据
+function ensureRepoLocalDevRuntimeRoot() {
+  const dir = path.join(repoRoot, DEV_RUNTIME_DIRNAME);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function usesRepoLocalDevRuntime() {
+  return requestedCommand === "dev" || requestedCommand === DEV_WITH_MCP_COMMAND;
 }
 
 function resolveIsolatedRuntimeBase(requestedBase) {
@@ -229,7 +275,7 @@ function resolveIsolatedRuntimeBase(requestedBase) {
 
   const localConfigPath = path.join(repoRoot, LOCAL_DEV_CONFIG_FILE);
   if (!existsSync(localConfigPath)) {
-    return tmpdir();
+    return null;
   }
 
   let localConfig;
@@ -243,7 +289,7 @@ function resolveIsolatedRuntimeBase(requestedBase) {
 
   const localBase = localConfig?.isolatedRuntimeBase;
   if (localBase == null || localBase === "") {
-    return tmpdir();
+    return null;
   }
   if (typeof localBase !== "string" || !path.isAbsolute(localBase)) {
     throw new Error(`${LOCAL_DEV_CONFIG_FILE} isolatedRuntimeBase must be an absolute path.`);
@@ -253,6 +299,7 @@ function resolveIsolatedRuntimeBase(requestedBase) {
 
 function printIsolatedDevHelp() {
   console.log(`Usage:
+  bun tauri dev --isolated [options]
   bun tauri dev-mcp --isolated [options]
   bun tauri dev-mcp-isolated [options]
   bun run locus:test:app -- [options]
@@ -268,8 +315,10 @@ Options:
   --skip-onboarding         Open the isolated instance directly in Chat
 
 Generated runtime root precedence: --runtime-base,
-${ISOLATED_RUNTIME_BASE_ENV_KEY}, ${LOCAL_DEV_CONFIG_FILE}, then the system
-temporary directory. Locus prints the result as LOCUS_RUNTIME_JSON.`);
+${ISOLATED_RUNTIME_BASE_ENV_KEY}, ${LOCAL_DEV_CONFIG_FILE}. When none of them
+is set a dev command reuses ${DEV_RUNTIME_DIRNAME} in the repository and other
+commands use the system temporary directory. Locus prints the result as
+LOCUS_RUNTIME_JSON.`);
 }
 
 function hasConfigArg(currentArgs) {

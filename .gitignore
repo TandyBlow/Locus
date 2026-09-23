@@ -11,6 +11,7 @@
 *.local
 *.local.*
 .locus-dev.local.json
+.locus-dev-runtime/
 .mcp.json
 .npmrc
 .pypirc
@@ -120,6 +121,7 @@ locus_unity/Editor/Roslyn/Locus.Roslyn.dll
 
 # Claude Code
 .claude
+CLAUDE.md
 
 # Workspace-only directories
 plans/

@@ -98,6 +98,42 @@ describe("runtime data isolation", () => {
     expect(launcher).toContain('env[SKIP_ONBOARDING_ENV_KEY] = "1"');
   });
 
+  it("refuses to start a dev instance without an isolated runtime", () => {
+    const launcher = read("scripts/run-tauri.mjs");
+
+    expect(launcher).toContain(
+      "[locus] Refusing to start a dev instance without an isolated runtime.",
+    );
+    expect(launcher).toContain("!hasRuntimeEnvOverride");
+    expect(launcher).toContain(
+      'RUNTIME_DATA_DIR_ENV_KEY = "LOCUS_RUNTIME_DATA_DIR"',
+    );
+    expect(launcher).toContain('RUNTIME_ROOT_ENV_KEY = "LOCUS_RUNTIME_ROOT"');
+  });
+
+  it("reuses a repository-local runtime directory for dev commands", () => {
+    const launcher = read("scripts/run-tauri.mjs");
+    const gitignore = read(".gitignore");
+
+    expect(launcher).toContain(
+      'const DEV_RUNTIME_DIRNAME = ".locus-dev-runtime"',
+    );
+    expect(launcher).toContain("usesRepoLocalDevRuntime()");
+    expect(launcher).toContain("ensureRepoLocalDevRuntimeRoot()");
+    expect(gitignore).toContain(".locus-dev-runtime");
+  });
+
+  it("never adopts another install's packaged data directory", () => {
+    const storage = read("src-tauri/src/commands/storage.rs");
+
+    expect(storage).toContain(
+      "fn is_foreign_packaged_data_dir(candidate: &Path, current_exe_dir: &Path)",
+    );
+    expect(storage).toContain(
+      "is_foreign_packaged_data_dir(&previous_default, &dir)",
+    );
+  });
+
   it("discovers Bun without embedding a developer profile path", () => {
     const wrapper = read("scripts/chrome-devtools-mcp-wrapper.mjs");
 
