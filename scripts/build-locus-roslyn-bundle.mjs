@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -84,21 +84,33 @@ async function ensureIlRepack() {
     return;
   }
 
-  await rm(ilRepackDir, { recursive: true, force: true });
-  await mkdir(ilRepackDir, { recursive: true });
+  await extractArchive(packagePath, ilRepackDir);
+}
+
+async function extractArchive(archive, destination) {
+  await rm(destination, { recursive: true, force: true });
+  await mkdir(destination, { recursive: true });
 
   if (process.platform === "win32") {
+    // Windows PowerShell's Expand-Archive only accepts the .zip extension.
+    const zipCopy = archive.endsWith(".zip") ? archive : `${archive}.zip`;
+    if (zipCopy !== archive) {
+      await copyFile(archive, zipCopy);
+    }
     run("powershell", [
       "-NoProfile",
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
       "& { param($archive, $destination) Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force }",
-      packagePath,
-      ilRepackDir,
+      zipCopy,
+      destination,
     ]);
+    if (zipCopy !== archive) {
+      await rm(zipCopy, { force: true });
+    }
   } else {
-    run("unzip", ["-q", packagePath, "-d", ilRepackDir]);
+    run("unzip", ["-q", archive, "-d", destination]);
   }
 }
 
