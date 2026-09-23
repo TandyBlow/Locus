@@ -680,7 +680,7 @@ onUnmounted(() => {
           </svg>
           <span class="project-path">{{ projectPath }}</span>
         </div>
-        <div v-if="projectError" class="msg error">{{ projectError }}</div>
+        <div v-if="projectError" class="msg error ui-select-text">{{ projectError }}</div>
       </div>
 
       <p class="skip-hint">{{ t("onboarding.project.skipHint") }}</p>
@@ -722,7 +722,7 @@ onUnmounted(() => {
             {{ pluginInstalling ? t("onboarding.plugin.installing") : pluginStatus.status === 'missing' ? t("onboarding.plugin.install") : t("onboarding.plugin.update") }}
           </button>
         </template>
-        <div v-if="pluginError" class="msg error">{{ pluginError }}</div>
+        <div v-if="pluginError" class="msg error ui-select-text">{{ pluginError }}</div>
       </div>
 
       <div class="step-actions">
@@ -804,7 +804,7 @@ onUnmounted(() => {
               {{ gitConfigSaving ? t("git.config.saving") : t("common.save") }}
             </button>
           </div>
-          <div v-if="gitConfigError" class="msg error">{{ t("git.config.saveFailed", gitConfigError) }}</div>
+          <div v-if="gitConfigError" class="msg error ui-select-text">{{ t("git.config.saveFailed", gitConfigError) }}</div>
         </div>
 
         <template v-if="gitCanInit">
@@ -817,7 +817,7 @@ onUnmounted(() => {
           </button>
         </template>
         <div v-if="gitHelpText" class="hint-text">{{ gitHelpText }}</div>
-        <div v-if="gitError" class="msg error">{{ gitError }}</div>
+        <div v-if="gitError" class="msg error ui-select-text">{{ gitError }}</div>
         <GitMissingHelp
           v-if="gitProbeState && !gitProbeState.available"
           :probe="gitProbeState"

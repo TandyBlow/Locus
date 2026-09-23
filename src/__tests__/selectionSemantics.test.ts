@@ -29,6 +29,7 @@ describe("selection semantics", () => {
     const gitSidebar = read("src/components/collab/GitSidebar.vue");
     const markdownRenderer = read("src/components/MarkdownRenderer.vue");
     const assetChip = read("src/components/AssetChip.vue");
+    const onboarding = read("src/components/OnboardingView.vue");
 
     expect(chatView).toContain('class="chat-view-layout"');
     expect(chatTranscript).toMatch(/class="[^"]*\bchat-transcript-plain-text\b[^"]*\bui-select-text\b/);
@@ -52,5 +53,8 @@ describe("selection semantics", () => {
     expect(markdownRenderer).toMatch(/\.md-workspace-ref\s*\{[\s\S]*?user-select:\s*none;/);
     expect(markdownRenderer).toContain(".markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref, .md-unity-object-ref)");
     expect(assetChip).toMatch(/\.asset-chip\s*\{[\s\S]*?user-select:\s*none;/);
+
+    // Count, not toMatch: every onboarding error slot must be selectable.
+    expect(onboarding.match(/class="msg error ui-select-text"/g)).toHaveLength(4);
   });
 });
