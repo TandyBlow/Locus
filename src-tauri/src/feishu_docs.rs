@@ -754,21 +754,41 @@ fn normalize_open_base_url(value: &str) -> String {
     base.trim_end_matches('/').to_string()
 }
 
-fn open_api_url(open_base_url: &str, path: &str) -> String {
-    format!(
-        "{}/open-apis/{}",
-        normalize_open_base_url(open_base_url),
-        path.trim_start_matches('/')
-    )
+fn validate_open_base_url(value: &str) -> Result<(), String> {
+    let normalized = normalize_open_base_url(value);
+    let Ok(parsed) = Url::parse(&normalized) else {
+        return Err(format!("飞书服务地址无法解析: {}", value));
+    };
+    if parsed.scheme() != "https" {
+        return Err("飞书服务地址仅支持 https".to_string());
+    }
+    match parsed.host_str().unwrap_or("") {
+        "open.feishu.cn" | "open.larksuite.com" => Ok(()),
+        other => Err(format!(
+            "飞书服务地址仅允许 open.feishu.cn 或 open.larksuite.com，当前为 {}",
+            other
+        )),
+    }
 }
 
-fn accounts_base_url(open_base_url: &str) -> String {
+fn open_api_url(open_base_url: &str, path: &str) -> Result<String, String> {
+    validate_open_base_url(open_base_url)?;
+    let normalized = normalize_open_base_url(open_base_url);
+    Ok(format!(
+        "{}/open-apis/{}",
+        normalized,
+        path.trim_start_matches('/')
+    ))
+}
+
+fn accounts_base_url(open_base_url: &str) -> Result<String, String> {
+    validate_open_base_url(open_base_url)?;
     let normalized = normalize_open_base_url(open_base_url);
     let Ok(parsed) = Url::parse(&normalized) else {
-        return FEISHU_REFERENCE_DEFAULT_ACCOUNTS_BASE_URL.to_string();
+        return Ok(FEISHU_REFERENCE_DEFAULT_ACCOUNTS_BASE_URL.to_string());
     };
     let Some(host) = parsed.host_str() else {
-        return FEISHU_REFERENCE_DEFAULT_ACCOUNTS_BASE_URL.to_string();
+        return Ok(FEISHU_REFERENCE_DEFAULT_ACCOUNTS_BASE_URL.to_string());
     };
     let account_host = if let Some(stripped) = host.strip_prefix("open.") {
         format!("accounts.{}", stripped)
@@ -777,14 +797,14 @@ fn accounts_base_url(open_base_url: &str) -> String {
     } else {
         format!("accounts.{}", host)
     };
-    format!("{}://{}", parsed.scheme(), account_host)
+    Ok(format!("{}://{}", parsed.scheme(), account_host))
 }
 
-fn accounts_authorize_url(open_base_url: &str) -> String {
-    format!(
+fn accounts_authorize_url(open_base_url: &str) -> Result<String, String> {
+    Ok(format!(
         "{}/open-apis/authen/v1/authorize",
-        accounts_base_url(open_base_url)
-    )
+        accounts_base_url(open_base_url)?
+    ))
 }
 
 fn feishu_oauth_callback_url_for_port(port: u16) -> String {
@@ -1837,7 +1857,7 @@ async fn fetch_tenant_access_token(
         .post(open_api_url(
             &config.open_base_url,
             "auth/v3/tenant_access_token/internal",
-        ))
+        )?)
         .json(&serde_json::json!({
             "app_id": config.app_id,
             "app_secret": app_secret,
@@ -1894,7 +1914,7 @@ async fn fetch_user_info(
     access_token: &str,
 ) -> Result<FeishuUserInfoData, String> {
     let response = client
-        .get(open_api_url(&config.open_base_url, "authen/v1/user_info"))
+        .get(open_api_url(&config.open_base_url, "authen/v1/user_info")?)
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
@@ -1936,7 +1956,7 @@ async fn exchange_authorization_code(
     code_verifier: &str,
 ) -> Result<FeishuStoredUserToken, String> {
     let response = client
-        .post(open_api_url(&config.open_base_url, "authen/v2/oauth/token"))
+        .post(open_api_url(&config.open_base_url, "authen/v2/oauth/token")?)
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
             "client_id": config.app_id,
@@ -1983,7 +2003,7 @@ async fn refresh_user_access_token(
     previous_token: &FeishuStoredUserToken,
 ) -> Result<FeishuStoredUserToken, String> {
     let response = client
-        .post(open_api_url(&config.open_base_url, "authen/v2/oauth/token"))
+        .post(open_api_url(&config.open_base_url, "authen/v2/oauth/token")?)
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "client_id": config.app_id,
@@ -2082,7 +2102,7 @@ async fn fetch_all_spaces(
     let mut spaces = Vec::new();
     loop {
         let mut request = client
-            .get(open_api_url(&config.open_base_url, "wiki/v2/spaces"))
+            .get(open_api_url(&config.open_base_url, "wiki/v2/spaces")?)
             .header("Authorization", format!("Bearer {}", access_token))
             .query(&[("page_size", "50")]);
         if let Some(token) = page_token.as_deref() {
@@ -2140,7 +2160,7 @@ async fn fetch_space_nodes_page(
         .get(open_api_url(
             &config.open_base_url,
             &format!("wiki/v2/spaces/{}/nodes", space_id),
-        ))
+        )?)
         .header("Authorization", format!("Bearer {}", access_token))
         .query(&[("page_size", "50")]);
     if let Some(token) = parent_node_token.filter(|value| !value.trim().is_empty()) {
@@ -2211,7 +2231,7 @@ async fn fetch_node_detail(
         .get(open_api_url(
             &config.open_base_url,
             "wiki/v2/spaces/get_node",
-        ))
+        )?)
         .header("Authorization", format!("Bearer {}", access_token))
         .query(&[("token", node_token)])
         .send()
@@ -2241,7 +2261,7 @@ async fn fetch_docx_raw_content(
         .get(open_api_url(
             &config.open_base_url,
             &format!("docx/v1/documents/{}/raw_content", document_id),
-        ))
+        )?)
         .header("Authorization", format!("Bearer {}", access_token))
         .query(&[("lang", "0")])
         .send()
@@ -2311,7 +2331,7 @@ async fn fetch_docx_blocks(
             .get(open_api_url(
                 &config.open_base_url,
                 &format!("docx/v1/documents/{}/blocks", document_id),
-            ))
+            )?)
             .header("Authorization", format!("Bearer {}", access_token))
             .query(&[("page_size", "500")]);
         if let Some(token) = page_token.as_deref() {
@@ -3886,6 +3906,8 @@ pub async fn save_feishu_reference_config(
         requested_space_name.clone(),
         requested_roots.clone(),
     );
+    validate_open_base_url(&input.open_base_url)?;
+
     let mut next_config = FeishuReferenceConfig {
         auth_mode: input.auth_mode,
         oauth_persistence_mode: input.oauth_persistence_mode,
@@ -4072,7 +4094,7 @@ pub async fn start_feishu_reference_oauth(
     })
     .await;
 
-    let mut authorize_url = Url::parse(&accounts_authorize_url(&config.open_base_url))
+    let mut authorize_url = Url::parse(&accounts_authorize_url(&config.open_base_url)?)
         .map_err(|error| format!("构造飞书授权地址失败: {}", error))?;
     authorize_url
         .query_pairs_mut()
@@ -4621,6 +4643,32 @@ pub async fn delete_feishu_reference_docs(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_api_url_allows_feishu_hosts_only() {
+        assert!(open_api_url("", "auth/v3/x").is_ok());
+        assert!(open_api_url("https://open.feishu.cn", "auth/v3/x").is_ok());
+        assert!(open_api_url("open.larksuite.com", "auth/v3/x").is_ok());
+    }
+
+    #[test]
+    fn open_api_url_rejects_foreign_and_insecure_hosts() {
+        assert!(open_api_url("https://evil.com", "auth/v3/x").is_err());
+        assert!(open_api_url("http://open.feishu.cn", "auth/v3/x").is_err());
+        assert!(open_api_url("https://open.feishu.cn.evil.com", "auth/v3/x").is_err());
+        let message = open_api_url("https://evil.com", "auth/v3/x").unwrap_err();
+        assert!(message.contains("open.feishu.cn"));
+    }
+
+    #[test]
+    fn accounts_base_url_derives_from_allowed_hosts() {
+        assert_eq!(
+            accounts_base_url("open.larksuite.com").unwrap(),
+            "https://accounts.larksuite.com"
+        );
+        assert_eq!(accounts_base_url("").unwrap(), "https://accounts.feishu.cn");
+        assert!(accounts_base_url("https://evil.com").is_err());
+    }
+
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
