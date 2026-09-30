@@ -408,6 +408,7 @@ namespace Locus
                 LocusAsync.CreateTcs<PipeEnvelope>();
             public PipeEnvelope CompletedResponse;
             public long CompletedAtUtcTicks;
+            public volatile bool CancelRequested;
 
             public ExecuteCodeIdempotencyEntry(string executionId, string requestSignature)
             {
@@ -675,12 +676,22 @@ namespace Locus
             {
                 ExecuteCodeRequestState requestState = FindExecuteCodeRequestState(normalized);
                 if (requestState == null)
-                    return OkResponse(requestId, "no active execute_code for " + normalized);
+                {
+                    ExecuteCodeIdempotencyEntry entry = FindExecuteCodeEntry(normalized);
+                    if (entry == null || entry.CompletedResponse != null)
+                        return OkResponse(requestId, "no active execute_code for " + normalized);
+                    return CancelQueuedExecuteCode(requestId, normalized, entry);
+                }
                 requestState.Cancel();
                 requestState.ResetProgress();
                 return OkResponse(requestId, "execute_code cancellation requested for " + normalized);
             }
 
+            lock (_executeCodeIdempotencyLock)
+            {
+                foreach (ExecuteCodeIdempotencyEntry entry in _activeExecuteCodeEntries.Values)
+                    entry.CancelRequested = true;
+            }
             ExecuteCodeRequestState[] states;
             lock (_executeCodeRequestStateLock)
                 states = _executeCodeRequestStates.Values.ToArray();
@@ -692,6 +703,24 @@ namespace Locus
                 states[i].ResetProgress();
             }
             return OkResponse(requestId, "execute_code cancellation requested for " + states.Length + " executions");
+        }
+
+        private static PipeEnvelope CancelQueuedExecuteCode(
+            string requestId,
+            string executionId,
+            ExecuteCodeIdempotencyEntry entry)
+        {
+            entry.CancelRequested = true;
+            // re-check registration race
+            ExecuteCodeRequestState requestState = FindExecuteCodeRequestState(executionId);
+            if (requestState != null)
+            {
+                requestState.Cancel();
+                requestState.ResetProgress();
+            }
+            return OkResponse(
+                requestId,
+                "execute_code cancellation requested for queued execution " + executionId);
         }
 
         private static async Task MonitorExecuteCodeClientHeartbeatAsync(ExecuteCodeRequestState requestState)
@@ -1028,8 +1057,16 @@ namespace Locus
             ExecuteCodeRequestState requestState = null;
             try
             {
-                requestState = new ExecuteCodeRequestState(executionId, sourceCode);
-                RegisterExecuteCodeRequestState(requestState);
+                lock (_executeCodeIdempotencyLock)
+                {
+                    ExecuteCodeIdempotencyEntry pendingEntry = FindExecuteCodeEntry(executionId);
+                    if (pendingEntry != null && pendingEntry.CancelRequested)
+                        return ErrorResponse(
+                            requestId,
+                            "execute_code " + executionId + " was cancelled while queued");
+                    requestState = new ExecuteCodeRequestState(executionId, sourceCode);
+                    RegisterExecuteCodeRequestState(requestState);
+                }
                 _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
                 LogExecuteCodeDebug(requestId, "request state registered");
 
