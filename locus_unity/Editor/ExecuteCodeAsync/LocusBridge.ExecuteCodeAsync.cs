@@ -49,18 +49,57 @@ namespace Locus
             }
         }
 
+        internal sealed class ExecuteCodeOutcome
+        {
+            public readonly bool IsError;
+            public readonly string Text;
+
+            private ExecuteCodeOutcome(bool isError, string text)
+            {
+                IsError = isError;
+                Text = text;
+            }
+
+            public static ExecuteCodeOutcome Ok(string text)
+            {
+                return new ExecuteCodeOutcome(false, text);
+            }
+
+            public static ExecuteCodeOutcome Error(string text)
+            {
+                return new ExecuteCodeOutcome(true, text);
+            }
+        }
+
         internal sealed class AsyncSnippetExecution : IDisposable
         {
             private long _lastActivityTimestamp;
+            private int _pendingWaits;
 
             public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
-            public readonly TaskCompletionSource<string> Completion = LocusAsync.CreateTcs<string>();
+            public readonly TaskCompletionSource<ExecuteCodeOutcome> Completion = LocusAsync.CreateTcs<ExecuteCodeOutcome>();
             public volatile ScriptGlobals Globals;
             public volatile string TimeoutError;
+            public volatile bool RuntimeEntered;
 
             public AsyncSnippetExecution()
             {
                 TouchActivity();
+            }
+
+            public int PendingWaits
+            {
+                get { return Interlocked.CompareExchange(ref _pendingWaits, 0, 0); }
+            }
+
+            public void EnterWait()
+            {
+                Interlocked.Increment(ref _pendingWaits);
+            }
+
+            public void ExitWait()
+            {
+                Interlocked.Decrement(ref _pendingWaits);
             }
 
             public void TouchActivity()
@@ -1133,13 +1172,13 @@ namespace Locus
                 requestState.SetStage("Executing snippet");
                 LogExecuteCodeDebug(requestId, "queueing snippet on Unity main thread");
                 long executeStartedMs = DebugElapsedMilliseconds(requestStarted);
-                Task<string> executionTask = ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
+                Task<ExecuteCodeOutcome> executionTask = ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
                 if (lockTaken)
                 {
                     _executeCodeLock.Release();
                     lockTaken = false;
                 }
-                string resultText = await executionTask;
+                ExecuteCodeOutcome resultText = await executionTask;
                 if (ExecuteCodeDebugLoggingEnabled)
                 {
                     LogExecuteCodeDebug(
@@ -1147,16 +1186,16 @@ namespace Locus
                         "main-thread execution returned in " +
                         (DebugElapsedMilliseconds(requestStarted) - executeStartedMs) +
                         "ms, output chars=" +
-                        (resultText == null ? 0 : resultText.Length));
+                        (resultText.Text == null ? 0 : resultText.Text.Length));
                 }
 
-                if (resultText.StartsWith("__ERROR__: ", StringComparison.Ordinal))
+                if (resultText.IsError)
                 {
                     requestState.ThrowIfCancellationRequested();
                     requestState.SetStage("Execution failed");
                     if (ExecuteCodeDebugLoggingEnabled)
-                        LogExecuteCodeDebug(requestId, "execution failed: " + resultText);
-                    return ErrorResponse(requestId, resultText.Substring("__ERROR__: ".Length));
+                        LogExecuteCodeDebug(requestId, "execution failed: " + resultText.Text);
+                    return ErrorResponse(requestId, resultText.Text);
                 }
 
                 requestState.ThrowIfCancellationRequested();
@@ -1167,7 +1206,7 @@ namespace Locus
                         requestId,
                         "complete after " + DebugElapsedMilliseconds(requestStarted) + "ms");
                 }
-                return OkResponse(requestId, resultText);
+                return OkResponse(requestId, resultText.Text);
             }
             catch (OperationCanceledException)
             {
@@ -1476,18 +1515,25 @@ namespace Locus
             return sb.ToString();
         }
 
-        private static Task<string> ExecuteAsyncSnippetOnMainThreadAsync(
+        private static Task<ExecuteCodeOutcome> ExecuteAsyncSnippetOnMainThreadAsync(
             CompiledAsyncSnippet snippet,
             ExecuteCodeRequestState requestState)
         {
             var execution = new AsyncSnippetExecution();
+            _ = execution.Completion.Task.ContinueWith(
+                _ =>
+                {
+                    if (execution.RuntimeEntered)
+                        PostToMainThread(EndAsyncExecuteRuntime);
+                },
+                TaskScheduler.Default);
             if (requestState != null)
                 requestState.SetExecution(execution);
 
             if (requestState != null && requestState.IsCancellationRequested)
             {
                 execution.Cancel();
-                execution.Completion.TrySetResult("__ERROR__: execution canceled");
+                execution.Completion.TrySetResult(ExecuteCodeOutcome.Error("execution canceled"));
                 return execution.Completion.Task;
             }
 
@@ -1496,7 +1542,7 @@ namespace Locus
                 if (requestState != null && requestState.IsCancellationRequested)
                 {
                     execution.Cancel();
-                    execution.Completion.TrySetResult("__ERROR__: execution canceled");
+                    execution.Completion.TrySetResult(ExecuteCodeOutcome.Error("execution canceled"));
                     return;
                 }
 
@@ -1520,6 +1566,9 @@ namespace Locus
                     if (execution.Completion.Task.IsCompleted)
                         return;
 
+                    if (execution.PendingWaits > 0)
+                        continue;
+
                     if (execution.IdleSeconds < ExecuteTimeoutMs / 1000.0)
                         continue;
 
@@ -1541,6 +1590,7 @@ namespace Locus
             AsyncSnippetExecution execution,
             ExecuteCodeRequestState requestState)
         {
+            execution.RuntimeEntered = true;
             BeginAsyncExecuteRuntime();
 
             ExecuteCodeContext ctx = null;
@@ -1553,7 +1603,7 @@ namespace Locus
 
                 globals = new ScriptGlobals(execution.TouchActivity);
                 execution.Globals = globals;
-                ctx = new ExecuteCodeContext(execution.Cancellation, execution.TouchActivity, requestState);
+                ctx = new ExecuteCodeContext(execution.Cancellation, execution.TouchActivity, requestState, execution);
                 ctx.InitializeProfilerOutput(globals.print);
 
                 object returnValue = await snippet.Executor(globals, ctx, execution.Cancellation.Token);
@@ -1561,7 +1611,7 @@ namespace Locus
                 if (returnValue != null)
                     globals.print(returnValue);
 
-                execution.Completion.TrySetResult(globals.GetOutput());
+                execution.Completion.TrySetResult(ExecuteCodeOutcome.Ok(globals.GetOutput()));
             }
             catch (ExecuteCodeBreakpointReachedException breakpoint)
             {
@@ -1571,7 +1621,7 @@ namespace Locus
                     : "status: breakpoint\neditor_status: playing_paused";
                 if (!string.IsNullOrEmpty(output))
                     result = output.TrimEnd() + "\n" + result;
-                execution.Completion.TrySetResult(result);
+                execution.Completion.TrySetResult(ExecuteCodeOutcome.Ok(result));
             }
             catch (OperationCanceledException)
             {
@@ -1593,15 +1643,14 @@ namespace Locus
                     requestState.ClearExecution(execution);
 
                 execution.Dispose();
-                EndAsyncExecuteRuntime();
             }
         }
 
-        private static string ExecuteCodeErrorWithOutput(string error, ScriptGlobals globals)
+        private static ExecuteCodeOutcome ExecuteCodeErrorWithOutput(string error, ScriptGlobals globals)
         {
             string output = globals == null ? "" : globals.GetOutput();
-            return "__ERROR__: " + error
-                + (string.IsNullOrEmpty(output) ? "" : "\n\nOutput before error:\n" + output.TrimEnd());
+            return ExecuteCodeOutcome.Error(error
+                + (string.IsNullOrEmpty(output) ? "" : "\n\nOutput before error:\n" + output.TrimEnd()));
         }
 
         private static void PumpExecuteCodeAsyncRuntime()
@@ -1748,16 +1797,25 @@ namespace Locus
             private readonly CancellationTokenSource _cancellation;
             private readonly Action _touchActivity;
             private readonly ExecuteCodeRequestState _requestState;
+            private readonly AsyncSnippetExecution _execution;
             private Exception _waitException;
 
             internal ExecuteCodeContext(
                 CancellationTokenSource cancellation,
                 Action touchActivity,
-                ExecuteCodeRequestState requestState)
+                ExecuteCodeRequestState requestState,
+                AsyncSnippetExecution execution)
             {
                 _cancellation = cancellation;
                 _touchActivity = touchActivity;
                 _requestState = requestState;
+                _execution = execution;
+            }
+
+            internal void OnWaitDispatched()
+            {
+                if (_execution != null)
+                    _execution.ExitWait();
             }
 
             public CancellationToken CancellationToken
@@ -1968,6 +2026,9 @@ namespace Locus
                     ? 0
                     : EditorApplication.timeSinceStartup + seconds;
 
+                if (_execution != null)
+                    _execution.EnterWait();
+
                 SetAwaiting(waitKind, waitTarget, waitCondition, sourceLine);
 
                 ScheduleExecuteContinuation(new ExecuteCodeWaitState(
@@ -2159,7 +2220,10 @@ namespace Locus
             public void InvokeContinuation()
             {
                 if (_context != null)
+                {
+                    _context.OnWaitDispatched();
                     _context.ClearAwaiting();
+                }
                 if (_synchronizationContext != null)
                     _synchronizationContext.Run(Continuation);
                 else
