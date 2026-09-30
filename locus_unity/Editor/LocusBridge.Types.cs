@@ -91,6 +91,9 @@ namespace Locus
 
         public sealed class ScriptGlobals
         {
+            // mirrors RunStates print cap
+            internal const int MaxOutputChars = 1000000;
+
             private readonly StringBuilder _output = new StringBuilder(256);
             private readonly Action _touchActivity;
 
@@ -124,7 +127,7 @@ namespace Locus
             {
                 TouchActivity();
                 string text = obj != null ? obj.ToString() : "null";
-                lock (_output) _output.AppendLine(text);
+                AppendOutput(text);
             }
 
             /// <summary>
@@ -137,29 +140,37 @@ namespace Locus
             public void printJson(object obj)
             {
                 TouchActivity();
+                string line;
                 if (obj == null)
                 {
-                    lock (_output) _output.AppendLine("null");
-                    return;
+                    line = "null";
                 }
-
-                try
+                else
                 {
-                    string json;
-                    if (obj is UnityEngine.Object uObj)
-                        json = EditorJsonUtility.ToJson(uObj, false);
-                    else
-                        json = Locus.Json.LocusJson.Serialize(obj);
-
-                    lock (_output) _output.AppendLine(json);
+                    try
+                    {
+                        if (obj is UnityEngine.Object uObj)
+                            line = EditorJsonUtility.ToJson(uObj, false);
+                        else
+                            line = Locus.Json.LocusJson.Serialize(obj);
+                    }
+                    catch (Exception ex)
+                    {
+                        Type errorType = ex.GetType();
+                        line = "[printJson error: " + (errorType.FullName ?? errorType.Name) + "]";
+                    }
                 }
-                catch (Exception ex)
+                AppendOutput(line);
+            }
+
+            private void AppendOutput(string text)
+            {
+                lock (_output)
                 {
-                    Type errorType = ex.GetType();
-                    lock (_output)
-                        _output.Append("[printJson error: ")
-                               .Append(errorType.FullName ?? errorType.Name)
-                               .AppendLine("]");
+                    if (_output.Length + text.Length > MaxOutputChars)
+                        throw new InvalidOperationException(
+                            "print output exceeded hard limit (1000000 chars); reduce output or call clear() periodically");
+                    _output.AppendLine(text);
                 }
             }
 
