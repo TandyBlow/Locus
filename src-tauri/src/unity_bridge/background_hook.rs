@@ -623,7 +623,13 @@ mod windows_impl {
         let mut records = Vec::new();
 
         for symbol in SYMBOLS {
-            let address = resolve_symbol(image_path, symbol_dir, &module, symbol)?;
+            let address = match resolve_symbol(image_path, symbol_dir, &module, symbol) {
+                Ok(address) => address,
+                Err(error) => {
+                    rollback_partial(process.raw(), &records);
+                    return Err(error);
+                }
+            };
             if address < module.base || address >= module.base.saturating_add(module.size as u64) {
                 rollback_partial(process.raw(), &records);
                 return Err(format!(
@@ -632,7 +638,13 @@ mod windows_impl {
                 ));
             }
 
-            let original = read_remote(process.raw(), address, 16)?;
+            let original = match read_remote(process.raw(), address, 16) {
+                Ok(original) => original,
+                Err(error) => {
+                    rollback_partial(process.raw(), &records);
+                    return Err(error);
+                }
+            };
             let already_patched = original.starts_with(&PATCH_BYTES);
             if !already_patched {
                 if let Err(error) = write_remote(process.raw(), address, &PATCH_BYTES) {
