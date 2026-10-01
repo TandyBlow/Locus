@@ -20,6 +20,26 @@ const USAGE_REFRESH_TIMEOUT_SECS: u64 = 8;
 const RESET_CREDIT_DETAILS_TIMEOUT_SECS: u64 = 5;
 const RESET_CREDIT_CONSUME_TIMEOUT_SECS: u64 = 10;
 
+/// ChatGPT OAuth tokens are only valid against the ChatGPT backend; the
+/// app-wide base_url is a relay for other providers and must not receive
+/// this token.
+pub(crate) fn chatgpt_scoped_base_url(base_url: Option<&str>) -> Option<String> {
+    let normalized = base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .trim_end_matches('/')
+        .to_string();
+    let parsed = url::Url::parse(&normalized).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    matches!(
+        parsed.host_str(),
+        Some("chatgpt.com") | Some("chat.openai.com")
+    )
+    .then_some(normalized)
+}
+
 #[derive(Debug)]
 pub enum CodexRateLimitsFetchError {
     Unauthorized(String),
@@ -598,11 +618,36 @@ fn codex_rate_limit_reset_credits_consume_endpoint(base_url: Option<&str>) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_rate_limit_reset_credits_consume_endpoint, codex_rate_limit_reset_credits_endpoint,
-        codex_usage_endpoint, rate_limit_reset_credits_from_details, rate_limits_from_payload,
-        summarize_error_body, CodexRateLimitResetOutcome, CodexUsagePayload,
+        chatgpt_scoped_base_url, codex_rate_limit_reset_credits_consume_endpoint,
+        codex_rate_limit_reset_credits_endpoint, codex_usage_endpoint,
+        rate_limit_reset_credits_from_details, rate_limits_from_payload, summarize_error_body,
+        CodexRateLimitResetOutcome, CodexUsagePayload,
         CodexUsageRateLimitResetConsumeResponse, CodexUsageRateLimitResetCreditsDetails,
     };
+
+    #[test]
+    fn chatgpt_scoped_base_url_rejects_non_chatgpt_hosts() {
+        assert!(chatgpt_scoped_base_url(Some("https://evil.com")).is_none());
+        assert!(chatgpt_scoped_base_url(Some("https://chatgpt.com.evil.com")).is_none());
+        assert!(chatgpt_scoped_base_url(Some("http://chatgpt.com")).is_none());
+        assert!(chatgpt_scoped_base_url(Some("")).is_none());
+        assert!(chatgpt_scoped_base_url(None).is_none());
+    }
+
+    #[test]
+    fn chatgpt_scoped_base_url_allows_chatgpt_hosts() {
+        assert_eq!(
+            chatgpt_scoped_base_url(Some("https://chatgpt.com")).as_deref(),
+            Some("https://chatgpt.com")
+        );
+        assert_eq!(
+            chatgpt_scoped_base_url(Some("https://chat.openai.com/")).as_deref(),
+            Some("https://chat.openai.com")
+        );
+        assert!(chatgpt_scoped_base_url(Some("https://chatgpt.com/backend-api/codex/responses"))
+            .is_some());
+    }
+
     use serde_json::json;
 
     #[test]

@@ -444,7 +444,7 @@ pub async fn codex_rate_limits(
     match crate::llm::codex_usage::fetch_codex_rate_limits(
         &access_token,
         account_id.as_deref(),
-        config.base_url.as_deref(),
+        crate::llm::codex_usage::chatgpt_scoped_base_url(config.base_url.as_deref()).as_deref(),
     )
     .await
     {
@@ -461,7 +461,8 @@ pub async fn codex_rate_limits(
             crate::llm::codex_usage::fetch_codex_rate_limits(
                 &access_token,
                 account_id.as_deref(),
-                config.base_url.as_deref(),
+                crate::llm::codex_usage::chatgpt_scoped_base_url(config.base_url.as_deref())
+                    .as_deref(),
             )
             .await
             .map_err(|err| AppError::from(err.to_string()))
@@ -490,7 +491,7 @@ pub async fn codex_consume_rate_limit_reset_credit(
     match crate::llm::codex_usage::consume_codex_rate_limit_reset_credit(
         &access_token,
         account_id.as_deref(),
-        config.base_url.as_deref(),
+        crate::llm::codex_usage::chatgpt_scoped_base_url(config.base_url.as_deref()).as_deref(),
         &redeem_request_id,
         credit_id.as_deref(),
     )
@@ -509,7 +510,8 @@ pub async fn codex_consume_rate_limit_reset_credit(
             crate::llm::codex_usage::consume_codex_rate_limit_reset_credit(
                 &access_token,
                 account_id.as_deref(),
-                config.base_url.as_deref(),
+                crate::llm::codex_usage::chatgpt_scoped_base_url(config.base_url.as_deref())
+                    .as_deref(),
                 &redeem_request_id,
                 credit_id.as_deref(),
             )
