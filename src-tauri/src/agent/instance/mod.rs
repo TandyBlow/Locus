@@ -13907,10 +13907,14 @@ impl AgentInstance {
     }
 
     fn normalize_global_permission_mode(mode: &str) -> PermissionModeSetting {
-        if mode.trim().eq_ignore_ascii_case("ask") {
+        let trimmed = mode.trim();
+        if trimmed.eq_ignore_ascii_case("ask") {
             PermissionModeSetting::Ask
-        } else {
+        } else if trimmed.eq_ignore_ascii_case("auto") {
             PermissionModeSetting::Auto
+        } else {
+            // fail closed: unknown values must not disable confirmation
+            PermissionModeSetting::Ask
         }
     }
 
@@ -26551,6 +26555,22 @@ Search, install, audit, and export a plugin.
             None,
             "unity_execute",
             &json!({})
+        ));
+    }
+
+    #[test]
+    fn unknown_global_permission_mode_fails_closed_to_ask() {
+        for mode in ["", "Auot", " ask ", "readonly", "yolo"] {
+            assert!(
+                AgentInstance::permission_requires_confirm(mode, None, "unity_execute", &json!({})),
+                "mode={mode:?}"
+            );
+        }
+        assert!(AgentInstance::permission_requires_confirm(
+            "ask", None, "unity_execute", &json!({})
+        ));
+        assert!(!AgentInstance::permission_requires_confirm(
+            "auto", None, "unity_execute", &json!({})
         ));
     }
 
