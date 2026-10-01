@@ -313,24 +313,212 @@ fn load_proxy_config() -> ProxyConfig {
         return ProxyConfig::default();
     };
 
-    std::fs::read_to_string(&path)
+    load_proxy_config_from(&path)
+}
+
+fn load_proxy_config_from(path: &std::path::Path) -> ProxyConfig {
+    let raw = std::fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<ProxyConfig>(&raw).ok())
-        .map(sanitize_proxy_config)
-        .unwrap_or_default()
+        .and_then(|raw| serde_json::from_str::<ProxyConfig>(&raw).ok());
+    let Some(config) = raw else {
+        return ProxyConfig::default();
+    };
+    let config = sanitize_proxy_config(config);
+
+    let mut manual = config.manual.clone();
+    let mut plain_manual = config.manual.clone();
+    let mut migrated = false;
+    for (field, value) in [
+        ("http_proxy", config.manual.http_proxy.clone()),
+        ("https_proxy", config.manual.https_proxy.clone()),
+        ("all_proxy", config.manual.all_proxy.clone()),
+    ] {
+        let (stripped, file_userinfo) = split_proxy_url_credentials(&value);
+        match keychain_get_secret(&proxy_credential_key(field)) {
+            Ok(stored) => {
+                if file_userinfo.is_some() {
+                    if stored.is_some() {
+                        migrated = true;
+                    } else if keychain_set_secret(
+                        &proxy_credential_key(field),
+                        file_userinfo.as_deref().unwrap_or_default(),
+                    )
+                    .is_ok()
+                    {
+                        migrated = true;
+                    }
+                }
+                let userinfo = stored.or(file_userinfo);
+                let joined = match userinfo {
+                    Some(userinfo) => rejoin_proxy_url_credentials(&stripped, &userinfo),
+                    None => stripped.clone(),
+                };
+                set_manual_field(&mut manual, field, joined);
+                set_manual_field(&mut plain_manual, field, stripped);
+            }
+            Err(error) => {
+                eprintln!("[Locus] proxy credential lookup failed for {field}: {error}");
+                // keychain unavailable: keep the file value working instead of
+                // stripping the user's credentials on every load, and skip the
+                // migration rewrite so credentials never disappear from disk
+                let joined = match &file_userinfo {
+                    Some(userinfo) => rejoin_proxy_url_credentials(&value, userinfo),
+                    None => value,
+                };
+                set_manual_field(&mut manual, field, joined);
+            }
+        }
+    }
+    if migrated {
+        let plain = ProxyConfig {
+            mode: config.mode,
+            manual: plain_manual,
+        };
+        if proxy_env_access_lock().try_lock().is_ok() {
+            if let Ok(json) = serde_json::to_string_pretty(&plain) {
+                let _ = std::fs::write(path, json);
+            }
+        }
+    }
+
+    ProxyConfig { mode: config.mode, manual }
+}
+
+fn set_manual_field(manual: &mut ManualProxyConfig, field: &str, value: String) {
+    match field {
+        "http_proxy" => manual.http_proxy = value,
+        "https_proxy" => manual.https_proxy = value,
+        "all_proxy" => manual.all_proxy = value,
+        _ => {}
+    }
+}
+
+fn manual_credential_fields(manual: &ManualProxyConfig) -> [(&'static str, &String); 3] {
+    [
+        ("http_proxy", &manual.http_proxy),
+        ("https_proxy", &manual.https_proxy),
+        ("all_proxy", &manual.all_proxy),
+    ]
+}
+
+fn proxy_credential_key(field: &str) -> String {
+    format!("locus:proxy:{field}")
+}
+
+#[cfg(not(test))]
+use crate::keychain::{
+    delete_secret as keychain_delete_secret, get_secret as keychain_get_secret,
+    set_secret as keychain_set_secret,
+};
+
+#[cfg(test)]
+fn keychain_set_secret(key: &str, value: &str) -> Result<(), String> {
+    test_keychain_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_string(), value.to_string());
+    Ok(())
+}
+
+#[cfg(test)]
+fn keychain_get_secret(key: &str) -> Result<Option<String>, String> {
+    Ok(test_keychain_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .cloned())
+}
+
+#[cfg(test)]
+fn keychain_delete_secret(key: &str) -> Result<(), String> {
+    test_keychain_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(key);
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_keychain_store() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    static STORE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Split `scheme://user:pass@host/...` into the credential-free URL and the
+/// userinfo. Anything that does not parse unambiguously comes back as-is with
+/// no credentials, so a mangled value can never silently rewrite the user's
+/// proxy config.
+fn split_proxy_url_credentials(raw: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return (raw.to_string(), None);
+    };
+    let scheme_ok = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !scheme_ok {
+        return (raw.to_string(), None);
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+    let Some(at) = authority.rfind('@') else {
+        return (raw.to_string(), None);
+    };
+    let userinfo = &authority[..at];
+    let host = &authority[at + 1..];
+    if userinfo.is_empty()
+        || host.is_empty()
+        || host.contains('@')
+        || userinfo.contains('@')
+        || userinfo.contains(['/', '?', '#'])
+    {
+        return (raw.to_string(), None);
+    }
+    (format!("{scheme}://{host}{tail}"), Some(userinfo.to_string()))
+}
+
+fn rejoin_proxy_url_credentials(raw: &str, userinfo: &str) -> String {
+    if userinfo.is_empty() {
+        return raw.to_string();
+    }
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') {
+        return raw.to_string();
+    }
+    format!("{scheme}://{userinfo}@{rest}")
 }
 
 pub fn save_proxy_config(config: ProxyConfig) -> Result<ProxyStatus, String> {
     let config = sanitize_proxy_config(config);
     let path = proxy_config_path()?;
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize proxy config: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to save proxy config '{}': {}", path.display(), e))?;
+    save_proxy_config_at(&path, config.clone())?;
 
     let _guard = proxy_env_access_guard();
     clear_locus_injected_proxy_env_unlocked();
     Ok(get_proxy_status_unlocked())
+}
+
+fn save_proxy_config_at(path: &std::path::Path, config: ProxyConfig) -> Result<(), String> {
+    let mut plain = config.clone();
+    for (field, value) in manual_credential_fields(&config.manual) {
+        let (stripped, userinfo) = split_proxy_url_credentials(value);
+        match userinfo {
+            Some(userinfo) => keychain_set_secret(&proxy_credential_key(field), &userinfo)?,
+            None => {
+                let _ = keychain_delete_secret(&proxy_credential_key(field));
+            }
+        }
+        set_manual_field(&mut plain.manual, field, stripped);
+    }
+    let json = serde_json::to_string_pretty(&plain)
+        .map_err(|e| format!("Failed to serialize proxy config: {}", e))?;
+    std::fs::write(path, json)
+        .map_err(|e| format!("Failed to save proxy config '{}': {}", path.display(), e))?;
+    Ok(())
 }
 
 fn proxy_env_access_lock() -> &'static Mutex<()> {
@@ -1715,6 +1903,153 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    #[test]
+    fn split_proxy_url_credentials_strips_unambiguous_userinfo() {
+        for (raw, stripped, userinfo) in [
+            (
+                "http://user:pass@proxy.local:8080",
+                "http://proxy.local:8080",
+                Some("user:pass"),
+            ),
+            (
+                "http://user:pass@proxy.local:8080/path?query=1#frag",
+                "http://proxy.local:8080/path?query=1#frag",
+                Some("user:pass"),
+            ),
+            (
+                "http://user:p%40ss@proxy.local",
+                "http://proxy.local",
+                Some("user:p%40ss"),
+            ),
+            (
+                "socks5://u@proxy.local:1080",
+                "socks5://proxy.local:1080",
+                Some("u"),
+            ),
+            ("http://proxy.local:8080", "http://proxy.local:8080", None),
+            ("http://[::1]:9", "http://[::1]:9", None),
+            // ambiguous or malformed shapes must come back untouched
+            ("http://u:p@s@proxy.local", "http://u:p@s@proxy.local", None),
+            ("http://@proxy.local", "http://@proxy.local", None),
+            ("proxy.local:8080", "proxy.local:8080", None),
+            ("", "", None),
+        ] {
+            let (got_stripped, got_userinfo) = split_proxy_url_credentials(raw);
+            assert_eq!(got_stripped, stripped, "raw={raw:?}");
+            assert_eq!(got_userinfo.as_deref(), userinfo, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejoin_proxy_url_credentials_restores_the_stripped_url() {
+        for (raw, userinfo) in [
+            ("http://user:pass@proxy.local:8080", "user:pass"),
+            ("http://u:p%40s@h/x", "u:p%40s"),
+            ("socks5://u@h:1", "u"),
+        ] {
+            let (stripped, got) = split_proxy_url_credentials(raw);
+            assert_eq!(got.as_deref(), Some(userinfo), "raw={raw:?}");
+            assert_eq!(
+                rejoin_proxy_url_credentials(&stripped, userinfo),
+                raw,
+                "roundtrip raw={raw:?}"
+            );
+        }
+        // rejoining a URL that still carries credentials must not double-join
+        assert_eq!(
+            rejoin_proxy_url_credentials("http://a:b@h:1", "c:d"),
+            "http://a:b@h:1"
+        );
+    }
+
+    fn temp_proxy_config_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("locus-proxy-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("proxy.json")
+    }
+
+    fn manual_with(url: &str) -> ManualProxyConfig {
+        ManualProxyConfig {
+            http_proxy: url.to_string(),
+            https_proxy: String::new(),
+            all_proxy: String::new(),
+            no_proxy: String::new(),
+        }
+    }
+
+    #[test]
+    fn save_writes_credential_free_file_and_load_rejoins() {
+        let path = temp_proxy_config_path("roundtrip");
+        let config = ProxyConfig {
+            mode: ProxyMode::Manual,
+            manual: manual_with("http://user:pass@proxy.local:8080"),
+        };
+
+        save_proxy_config_at(&path, config.clone()).expect("save");
+
+        let file_text = std::fs::read_to_string(&path).expect("read saved file");
+        assert!(
+            !file_text.contains("user:pass"),
+            "credentials must not be written to disk: {file_text}"
+        );
+        assert!(file_text.contains("proxy.local:8080"));
+
+        let loaded = load_proxy_config_from(&path);
+        assert_eq!(loaded.manual.http_proxy, "http://user:pass@proxy.local:8080");
+
+        // saving a credential-free URL clears the stored credential
+        save_proxy_config_at(
+            &path,
+            ProxyConfig {
+                mode: ProxyMode::Manual,
+                manual: manual_with("http://proxy.local:8080"),
+            },
+        )
+        .expect("second save");
+        let loaded = load_proxy_config_from(&path);
+        assert_eq!(loaded.manual.http_proxy, "http://proxy.local:8080");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn load_migrates_plaintext_credentials_out_of_the_file() {
+        let path = temp_proxy_config_path("migrate");
+        let legacy = serde_json::json!({
+            "mode": "manual",
+            "manual": {
+                "httpProxy": "http://user:pass@proxy.local:8080",
+                "httpsProxy": "",
+                "allProxy": "",
+                "noProxy": ""
+            }
+        });
+        std::fs::write(&path, legacy.to_string()).expect("seed legacy file");
+
+        let loaded = load_proxy_config_from(&path);
+        assert_eq!(loaded.manual.http_proxy, "http://user:pass@proxy.local:8080");
+
+        let file_text = std::fs::read_to_string(&path).expect("read migrated file");
+        assert!(
+            !file_text.contains("user:pass"),
+            "migration must scrub the file: {file_text}"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    #[ignore = "touches the real OS keychain; run with --ignored once per machine"]
+    fn real_keychain_roundtrip_smoke() {
+        let key = format!("locus:proxy:smoke-{}", uuid::Uuid::new_v4());
+        keychain_set_secret(&key, "user:pass").expect("keychain set");
+        let read_back = keychain_get_secret(&key).expect("keychain get");
+        assert_eq!(read_back.as_deref(), Some("user:pass"));
+        keychain_delete_secret(&key).expect("keychain delete");
+        let after_delete = keychain_get_secret(&key).expect("keychain get after delete");
+        assert_eq!(after_delete, None);
+    }
 
     fn env_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
