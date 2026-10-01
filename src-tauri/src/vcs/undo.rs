@@ -912,7 +912,7 @@ impl UndoManager {
         let workspace_lock = self.workspace_lock(working_dir).await;
         let _workspace_guard = workspace_lock.write_owned().await;
 
-        let checkpoint = {
+        let (checkpoint, entry_files) = {
             let stacks = self.stacks.lock().await;
             let stack = stacks.get(session_id).ok_or_else(|| {
                 UndoRevertFileError::Other("no undo history for this session".to_string())
@@ -931,8 +931,21 @@ impl UndoManager {
                     target.working_dir
                 )));
             }
-            target.checkpoint.clone()
+            (target.checkpoint.clone(), target.changed_files.clone())
         };
+
+        // restore_files deletes anything absent from the checkpoint tree, so
+        // only paths the agent actually recorded in this round may be reverted.
+        let mut allowed = HashSet::new();
+        for recorded in &entry_files {
+            collect_changed_file_keys(recorded, &mut allowed);
+        }
+        if !changed_file_overlaps(&allowed, file) {
+            return Err(UndoRevertFileError::Other(format!(
+                "{} is not part of the recorded round; only files the agent changed can be reverted",
+                file.path
+            )));
+        }
 
         if !force {
             // Reuse the round-level dirty computation (last-writer-wins per
@@ -1969,6 +1982,43 @@ mod tests {
                 .expect("tracked after forced revert")
                 .replace("\r\n", "\n"),
             "base\n",
+        );
+
+        std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
+    }
+
+    #[tokio::test]
+    async fn revert_file_rejects_paths_outside_the_recorded_round() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = setup_repo("revert-file-foreign");
+        let repo_str = repo.to_string_lossy().to_string();
+        let manager = UndoManager::new(GitProvider);
+
+        record_round(&manager, &repo, &repo_str, "s", "m1", |repo| {
+            write_file(&repo.join("tracked.txt"), "base\nagent\n");
+        })
+        .await;
+
+        // Untracked and never touched by the agent round.
+        write_file(&repo.join("canary.txt"), "user data\n");
+
+        for force in [false, true] {
+            let error = manager
+                .revert_file("s", "m1", &repo_str, &changed("A", "canary.txt"), force)
+                .await
+                .expect_err(&format!("foreign path with force={force} must be rejected"));
+            assert!(
+                !matches!(error, UndoRevertFileError::Dirty(_)),
+                "foreign path must not be misread as a dirty conflict: {error:?}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("canary.txt")).expect("canary survives"),
+            "user data\n"
         );
 
         std::fs::remove_dir_all(&repo).expect("cleanup temp repo");
