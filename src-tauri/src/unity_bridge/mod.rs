@@ -5149,7 +5149,23 @@ fn prune_run_states_compile_cache(cache: &mut HashMap<String, CachedRunStatesAss
 fn take_cached_run_states_compile(key: &str) -> Option<CachedRunStatesAssembly> {
     let mut cache = run_states_compile_cache().lock().ok()?;
     prune_run_states_compile_cache(&mut cache);
-    cache.remove(key)
+    let entry = cache.remove(key)?;
+    // the sidecar deletes dead-pid artifact dirs on restart; a cached
+    // path-only payload whose file is gone must fall back to a recompile
+    if cached_run_states_assembly_path_missing(&entry.payload) {
+        return None;
+    }
+    Some(entry)
+}
+
+fn cached_run_states_assembly_path_missing(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(path) = value.get("assembly_path").and_then(|p| p.as_str()) else {
+        return false;
+    };
+    !std::path::Path::new(path).is_file()
 }
 
 fn store_cached_run_states_compile(key: String, entry: CachedRunStatesAssembly) {
@@ -7457,6 +7473,53 @@ mod tests {
             .expect("result_file field")
             .to_string()
     }
+
+    #[test]
+    fn run_states_cache_rejects_entries_whose_assembly_file_is_gone() {
+        let key = format!("cache-test-{}", uuid::Uuid::new_v4());
+        let dead_path = std::env::temp_dir()
+            .join(format!("locus-cache-test-gone-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let dead_payload = serde_json::json!({
+            "entry_type": "host",
+            "assembly_path": dead_path,
+        })
+        .to_string();
+        super::store_cached_run_states_compile(
+            key.clone(),
+            super::CachedRunStatesAssembly {
+                payload: dead_payload,
+                inserted_at_ms: super::unix_now_ms(),
+            },
+        );
+        assert!(
+            super::take_cached_run_states_compile(&key).is_none(),
+            "a cached path-only payload whose file was pruned must be dropped, not served"
+        );
+
+        let live_path = std::env::temp_dir()
+            .join(format!("locus-cache-test-live-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&live_path, b"dll").expect("write live assembly stub");
+        let live_payload = serde_json::json!({
+            "entry_type": "host",
+            "assembly_path": live_path.to_string_lossy(),
+        })
+        .to_string();
+        super::store_cached_run_states_compile(
+            key.clone(),
+            super::CachedRunStatesAssembly {
+                payload: live_payload,
+                inserted_at_ms: super::unix_now_ms(),
+            },
+        );
+        assert!(
+            super::take_cached_run_states_compile(&key).is_some(),
+            "a live path must still be served from cache"
+        );
+        std::fs::remove_file(&live_path).ok();
+    }
+
 
     fn pipe_response(ok: bool, message: Option<&str>, error: Option<&str>) -> PipeResponse {
         PipeResponse {
