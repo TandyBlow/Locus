@@ -3069,7 +3069,35 @@ fn persist_run_states_result(project_path: &str, output: &str) -> Result<PathBuf
             error
         )
     })?;
+    prune_run_states_result_files(&dir, RUN_STATES_RESULT_FILES_KEEP);
     Ok(path)
+}
+
+const RUN_STATES_RESULT_FILES_KEEP: usize = 20;
+
+/// Every run above the inline print limit lands a permanent ~4 MB file here;
+/// keep the newest ones so the directory cannot grow without bound.
+fn prune_run_states_result_files(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("run-states-"))
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let over = files.len() - keep;
+    for (_, path) in files.into_iter().take(over) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn build_run_states_large_summary(
@@ -7472,6 +7500,39 @@ mod tests {
             .find_map(|line| line.strip_prefix("result_file: "))
             .expect("result_file field")
             .to_string()
+    }
+
+    #[test]
+    fn prune_run_states_result_files_keeps_newest() {
+        let dir = std::env::temp_dir().join(format!("locus-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create prune dir");
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("run-states-{i}.txt")), i.to_string())
+                .expect("write result stub");
+        }
+        std::fs::write(dir.join("other.txt"), "x").expect("write unrelated file");
+
+        super::prune_run_states_result_files(&dir, 3);
+
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(remaining.contains(&"other.txt".to_string()));
+        for i in 3..6 {
+            assert!(
+                remaining.contains(&format!("run-states-{i}.txt")),
+                "newest files must survive, remaining={remaining:?}"
+            );
+        }
+        for i in 0..3 {
+            assert!(
+                !remaining.contains(&format!("run-states-{i}.txt")),
+                "oldest files must be pruned, remaining={remaining:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
