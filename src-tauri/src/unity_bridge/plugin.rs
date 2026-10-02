@@ -27,6 +27,7 @@ pub struct PluginInstallPlan {
 const PLUGIN_DEFAULT_INSTALL_DIR: &str = "Packages/com.farlocus.locus";
 const PLUGIN_SKILLS_DIR: &str = "Editor/Skills";
 const PLUGIN_ASMDEF_NAME: &str = "Locus.Editor.asmdef";
+const PLUGIN_PACKAGE_NAME: &str = "com.farlocus.locus";
 const PLUGIN_HASH_FILE: &str = ".locus_plugin_hash";
 const PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(45);
 const PLUGIN_INSTALL_LOCK_RELEASE_SETTLE: Duration = Duration::from_secs(2);
@@ -147,6 +148,16 @@ fn push_installed_plugin_dir(
     }
 }
 
+fn is_locus_package_root(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value.get("name").and_then(|name| name.as_str()) == Some(PLUGIN_PACKAGE_NAME)
+}
+
 fn find_installed_plugin_dirs(project_path: &Path) -> Vec<InstalledPluginDir> {
     let search_roots = [
         (
@@ -193,13 +204,21 @@ fn find_installed_plugin_dirs(project_path: &Path) -> Vec<InstalledPluginDir> {
             let Some(editor_dir) = entry.path().parent() else {
                 continue;
             };
+            // require Editor layer
+            if !editor_dir.file_name().map_or(false, |name| {
+                name.to_string_lossy().eq_ignore_ascii_case("Editor")
+            }) {
+                continue;
+            }
             let Some(plugin_root) = editor_dir.parent() else {
                 continue;
             };
-
-            if location == PluginInstallLocation::Packages
-                && !plugin_root.join("package.json").is_file()
-            {
+            // stay strictly below search root
+            if plugin_root == search_root.as_path() || !plugin_root.starts_with(&search_root) {
+                continue;
+            }
+            // verify package identity
+            if !is_locus_package_root(plugin_root) {
                 continue;
             }
 
@@ -228,6 +247,13 @@ fn remove_plugin_dir(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn is_protected_project_dir(project_path: &Path, root: &Path) -> bool {
+    let key = normalize_path_key(root);
+    key == normalize_path_key(project_path)
+        || key == normalize_path_key(&project_path.join("Assets"))
+        || key == normalize_path_key(&project_path.join("Packages"))
 }
 
 fn is_access_denied_error(error: &str) -> bool {
@@ -548,6 +574,13 @@ fn install_or_update_plugin_with_source_dir(
     }
 
     for dir in installed_dirs {
+        if is_protected_project_dir(project_path, &dir.root) {
+            eprintln!(
+                "[Locus] refusing to remove protected project directory: {}",
+                dir.root.display()
+            );
+            continue;
+        }
         if normalize_path_key(&dir.root) != normalize_path_key(&install_dir) {
             preserve_installed_skill_files(&dir.root, &staging_dir)?;
         }
@@ -1157,6 +1190,189 @@ mod tests {
         assert!(temp
             .path()
             .join("Packages/com.farlocus.locus/Editor/Json/Locus.Json.dll",)
+            .is_file());
+    }
+
+    fn write_grid_canaries(root: &Path) -> Vec<(&'static str, &'static [u8])> {
+        let canaries: Vec<(&'static str, &'static [u8])> = vec![
+            ("README.md", b"readme"),
+            (
+                "ProjectSettings/ProjectVersion.txt",
+                b"m_EditorVersion: 2022.3.27f1c1",
+            ),
+            ("Packages/manifest.json", b"{\"dependencies\": {}}"),
+            ("Assets/main.unity", b"scene"),
+            ("Assets/Foo/UserScript.cs", b"user script"),
+            ("Assets/Foo/Bar/Deep.cs", b"deep"),
+            ("Packages/Foo/UserScript.cs", b"pkg user script"),
+        ];
+        for (rel, contents) in &canaries {
+            write_file(&root.join(rel), contents);
+        }
+        canaries
+    }
+
+    fn grid_candidate_root(asmdef_at: &str) -> String {
+        let parts: Vec<&str> = asmdef_at.split('/').collect();
+        if parts.len() < 3 {
+            String::new()
+        } else {
+            parts[..parts.len() - 2].join("/")
+        }
+    }
+
+    fn grid_expects_removal(asmdef_at: &str, package_json: Option<&str>) -> bool {
+        let Some(editor_dir) = Path::new(asmdef_at).parent() else {
+            return false;
+        };
+        if !editor_dir
+            .file_name()
+            .map_or(false, |name| name.to_string_lossy().eq_ignore_ascii_case("Editor"))
+        {
+            return false;
+        }
+        let candidate = grid_candidate_root(asmdef_at);
+        if !candidate.starts_with("Assets/") && !candidate.starts_with("Packages/") {
+            return false;
+        }
+        let Some(json) = package_json else {
+            return false;
+        };
+        let parsed: Option<serde_json::Value> = serde_json::from_str(json).ok();
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("name").and_then(|name| name.as_str()))
+            == Some("com.farlocus.locus")
+    }
+
+    #[test]
+    fn install_never_removes_unverified_candidate_roots() {
+        let source_dir = fixture_source_dir();
+        let positions = [
+            "Assets/Locus.Editor.asmdef",
+            "Assets/Editor/Locus.Editor.asmdef",
+            "Assets/Foo/Locus.Editor.asmdef",
+            "Assets/Foo/Editor/Locus.Editor.asmdef",
+            "Assets/Foo/Bar/Editor/Locus.Editor.asmdef",
+            "Assets/Foo/Editor/Editor/Locus.Editor.asmdef",
+            "Packages/Locus.Editor.asmdef",
+            "Packages/Editor/Locus.Editor.asmdef",
+            "Packages/Foo/Editor/Locus.Editor.asmdef",
+        ];
+        let package_json_variants: [Option<&str>; 5] = [
+            None,
+            Some("{}"),
+            Some("{\"name\": \"com.other.toolbox\"}"),
+            Some("{ not json"),
+            Some("{\"name\": \"com.farlocus.locus\"}"),
+        ];
+
+        let mut failures = Vec::new();
+        for asmdef_at in positions {
+            for package_json in package_json_variants {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                let canaries = write_grid_canaries(root);
+                write_file(&root.join(asmdef_at), b"{}");
+                let candidate = grid_candidate_root(asmdef_at);
+                if let Some(json) = package_json {
+                    let base = if candidate.is_empty() {
+                        root.to_path_buf()
+                    } else {
+                        root.join(&candidate)
+                    };
+                    write_file(&base.join("package.json"), json.as_bytes());
+                }
+
+                if let Err(error) = install_or_update_plugin_with_source_dir(&source_dir, root) {
+                    failures.push(format!(
+                        "{asmdef_at} + {package_json:?}: install failed: {error}"
+                    ));
+                    continue;
+                }
+
+                let verified = grid_expects_removal(asmdef_at, package_json);
+                let mut allowed: Vec<PathBuf> = vec![expected_install_dir(root)];
+                if verified {
+                    allowed.push(root.join(&candidate));
+                }
+
+                for (rel, _) in &canaries {
+                    let canary = root.join(rel);
+                    let inside_allowed = allowed.iter().any(|base| canary.starts_with(base));
+                    if !inside_allowed && !canary.is_file() {
+                        failures.push(format!(
+                            "{asmdef_at} + {package_json:?}: deleted canary {rel}"
+                        ));
+                    }
+                }
+
+                if verified && root.join(&candidate).join("package.json").is_file() {
+                    failures.push(format!(
+                        "{asmdef_at} + {package_json:?}: verified candidate {candidate} survived"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "contract violations:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn mixed_content_folder_with_stray_asmdef_survives_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = fixture_source_dir();
+        create_unity_project(temp.path());
+        write_file(
+            &temp.path().join("Assets/Scripts/PlayerController.cs"),
+            b"class PlayerController {}",
+        );
+        write_file(
+            &temp.path().join("Assets/Scripts/Editor/Locus.Editor.asmdef"),
+            b"{}",
+        );
+
+        let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
+        assert!(matches!(status, PluginStatus::Missing));
+
+        install_or_update_plugin_with_source_dir(&source_dir, temp.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(temp.path().join("Assets/Scripts/PlayerController.cs")).unwrap(),
+            b"class PlayerController {}".as_slice()
+        );
+        assert!(temp
+            .path()
+            .join("Assets/Scripts/Editor/Locus.Editor.asmdef")
+            .is_file());
+        let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
+        assert!(matches!(status, PluginStatus::UpToDate));
+    }
+
+    #[test]
+    fn nested_verified_plugin_still_migrates() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = fixture_source_dir();
+        create_unity_project(temp.path());
+
+        let nested = temp.path().join("Assets/Nested/Locus");
+        copy_plugin_dir(&source_dir, &nested).unwrap();
+        write_file(&temp.path().join("Assets/Nested/Neighbor.cs"), b"neighbor");
+
+        let status = check_plugin_status_with_source_dir(&source_dir, temp.path()).unwrap();
+        assert!(matches!(status, PluginStatus::Outdated));
+
+        install_or_update_plugin_with_source_dir(&source_dir, temp.path()).unwrap();
+
+        assert!(!nested.exists());
+        assert!(temp.path().join("Assets/Nested/Neighbor.cs").is_file());
+        assert!(temp
+            .path()
+            .join("Packages/com.farlocus.locus/package.json")
             .is_file());
     }
 }
