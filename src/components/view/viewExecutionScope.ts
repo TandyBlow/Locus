@@ -123,6 +123,7 @@ export function createViewExecutionScope(options: {
     };
     const scopedWindow = new Proxy(window, { get(target, key) {
       if (key === "window" || key === "self" || key === "globalThis") return scopedWindow;
+      if (typeof key === "string" && key.startsWith("__TAURI")) return undefined;
       if (typeof key === "string" && key in overrides) return overrides[key];
       const value = Reflect.get(target, key, target); return typeof value === "function" && !value.prototype ? value.bind(target) : value;
     } });

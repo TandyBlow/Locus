@@ -2948,6 +2948,7 @@ pub async fn hot_reload(
             Ok(summary)
         }
         crate::csharp_compile::HotPatchOutcome::CompileError(message) => {
+            record_patch_failure(project_path).await;
             record_failure_diagnostic(
                 project_path,
                 Some(&params.domain_generation),

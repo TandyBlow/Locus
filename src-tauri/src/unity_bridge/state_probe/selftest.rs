@@ -1404,6 +1404,21 @@ async fn run_owned(
     };
     test.log("Unity state-probe self-test starting…");
     test.run().await;
+
+    // The suite exists to verify the out-of-process native probe; if the
+    // stack tier never engaged, the pipe-plane passes must not read green.
+    let tier = format!("{:?}", status_for_project(&test.project).tier);
+    if tier != "Stack" {
+        test.fail(
+            "native probe tier verified",
+            format!(
+                "native stack tier never engaged (tier {tier}); the out-of-process probe \
+                 was not verified this run. Check that unity_x64.pdb sits next to the \
+                 editor executable and that the state probe is enabled."
+            ),
+        );
+    }
+
     let summary = format!("Finished: {} passed, {} failed", test.passed, test.failed);
     test.log(summary);
     test.emit(None, true);

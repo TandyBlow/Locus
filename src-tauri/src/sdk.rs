@@ -799,7 +799,8 @@ async fn codex_model_values(
                 if let Ok(models) = crate::llm::codex_models::list_codex_available_models(
                     &access_token,
                     account_id.as_deref(),
-                    config.base_url.as_deref(),
+                    crate::llm::codex_usage::chatgpt_scoped_base_url(config.base_url.as_deref())
+                        .as_deref(),
                     &cache_dir,
                 )
                 .await

@@ -11,6 +11,11 @@ pub(super) enum DangerousCommandKind {
     PowerShellForceDelete,
     CmdForceDelete,
     CmdRecursiveDelete,
+    FindDelete,
+    GitCleanForce,
+    GitResetHard,
+    RobocopyMirror,
+    DirectoryMoveOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +50,11 @@ impl DangerousCommandKind {
             Self::PowerShellForceDelete => "powershell_force_delete",
             Self::CmdForceDelete => "cmd_force_delete",
             Self::CmdRecursiveDelete => "cmd_recursive_delete",
+            Self::FindDelete => "find_delete",
+            Self::GitCleanForce => "git_clean_force",
+            Self::GitResetHard => "git_reset_hard",
+            Self::RobocopyMirror => "robocopy_mirror",
+            Self::DirectoryMoveOut => "directory_move_out",
         }
     }
 }
@@ -155,6 +165,26 @@ fn match_argv(command: &[String], depth: usize) -> Option<DangerousCommandMatch>
         "sh" | "bash" | "zsh" => match_nested_shell(command, depth + 1),
         "pwsh" | "powershell" => match_powershell(command),
         "cmd" => match_cmd(command),
+        "find" if command.iter().skip(1).any(|arg| arg == "-delete") => {
+            Some(DangerousCommandMatch::new(
+                DangerousCommandKind::FindDelete,
+                command,
+                leading_targets(&command[1..]),
+            ))
+        }
+        "git" => match_git(command),
+        "robocopy"
+            if command
+                .iter()
+                .any(|arg| arg.eq_ignore_ascii_case("/mir")) =>
+        {
+            Some(DangerousCommandMatch::new(
+                DangerousCommandKind::RobocopyMirror,
+                command,
+                leading_targets(&command[1..]),
+            ))
+        }
+        "mv" => match_mv(command),
         _ => None,
     }
 }
@@ -344,6 +374,65 @@ fn split_words(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn leading_targets(args: &[String]) -> Vec<String> {
+    args.iter()
+        .take_while(|arg| !arg.starts_with('-'))
+        .cloned()
+        .collect()
+}
+
+fn match_git(command: &[String]) -> Option<DangerousCommandMatch> {
+    let mut index = 1;
+    while matches!(command.get(index).map(String::as_str), Some("-C") | Some("-c")) {
+        index += 2;
+    }
+    let args = command.get(index + 1..)?;
+    match command.get(index).map(String::as_str) {
+        Some("clean") => {
+            let forced = args.iter().any(|arg| {
+                arg == "--force"
+                    || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('f'))
+            });
+            forced.then(|| {
+                DangerousCommandMatch::new(
+                    DangerousCommandKind::GitCleanForce,
+                    command,
+                    leading_targets(args),
+                )
+            })
+        }
+        Some("reset") if args.iter().any(|arg| arg == "--hard") => {
+            Some(DangerousCommandMatch::new(
+                DangerousCommandKind::GitResetHard,
+                command,
+                leading_targets(args),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn match_mv(command: &[String]) -> Option<DangerousCommandMatch> {
+    // mv -t <dest> <src...> keeps the destination behind a flag; that form
+    // stays outside this best-effort boundary like other dynamic shapes.
+    let destination = command
+        .iter()
+        .rev()
+        .find(|arg| !arg.starts_with('-'))
+        .filter(|dest| is_out_of_tree_path(dest))?;
+    Some(DangerousCommandMatch::new(
+        DangerousCommandKind::DirectoryMoveOut,
+        command,
+        vec![destination.clone()],
+    ))
+}
+
+fn is_out_of_tree_path(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with('~')
+        || path.as_bytes().get(1) == Some(&b':')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +462,50 @@ mod tests {
             "rm -r /tmp/example",
             "rm -- -f",
             "cmd=rm; $cmd -rf /tmp/example",
+        ] {
+            assert_eq!(dangerous_command_match(command), None, "command={command}");
+        }
+    }
+
+    #[test]
+    fn detects_irreversible_deletions_and_out_of_tree_moves() {
+        for (command, kind) in [
+            ("find Assets -delete", DangerousCommandKind::FindDelete),
+            ("git clean -fdx", DangerousCommandKind::GitCleanForce),
+            ("git clean --force", DangerousCommandKind::GitCleanForce),
+            ("git reset --hard HEAD~1", DangerousCommandKind::GitResetHard),
+            (
+                "robocopy C:/src C:/dst /MIR",
+                DangerousCommandKind::RobocopyMirror,
+            ),
+            ("mv Library /tmp/drain/", DangerousCommandKind::DirectoryMoveOut),
+            (
+                "for d in Library/*; do mv \"$d\" /tmp/drain/; done",
+                DangerousCommandKind::DirectoryMoveOut,
+            ),
+            (
+                "mv Tools \"D:\\backup\"",
+                DangerousCommandKind::DirectoryMoveOut,
+            ),
+        ] {
+            assert_eq!(
+                dangerous_command_match(command).map(|matched| matched.kind),
+                Some(kind),
+                "command={command}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_in_tree_moves_and_benign_forms_outside_the_match() {
+        for command in [
+            "mv src src-old",
+            "mv Packages/com.farlocus.locus Library/Locus/tmp/plugin-backup/",
+            "mv -f notes.txt notes-old.txt",
+            "git clean -n",
+            "git reset",
+            "robocopy C:/src C:/dst",
+            "find Assets -name '*.tmp'",
         ] {
             assert_eq!(dangerous_command_match(command), None, "command={command}");
         }
